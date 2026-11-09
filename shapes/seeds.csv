@@ -1,0 +1,6 @@
+seed,shape,style,colour,file
+0xc73bb1c90edcbc7d,star,outline,0,0xc73bb1c90edcbc7d_star_outline.png
+0x8923af73c6133f0a,pentagon,outline,0,0x8923af73c6133f0a_pentagon_outline.png
+0x032b815fe12b63d8,rectangle,filled,0,shape_001.png
+0x96a497255ca3369c,hexagon,filled,0,shape_002.png
+0x13a36b75ab2d5924,triangle,outline,0,shape_003.png
