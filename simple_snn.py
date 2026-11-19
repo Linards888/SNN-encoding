@@ -6,6 +6,8 @@ picture shows. Everything is plain NumPy so every step can be read.
 Run:
   python simple_snn.py                        train, test, save weights and plots
   python simple_snn.py --shapes circle square triangle star
+  python simple_snn.py --encoding latency     same, but pictures become spikes another way
+  python simple_snn.py --encoding phase       (rate, latency or phase; see spike_encodings.py)
   python simple_snn.py --predict shapes/shape_001.png   use saved weights on a picture
   python simple_snn.py --help                 all options
 
@@ -17,14 +19,20 @@ How it works
      (default 32x32) "darkness" values, 0 = white and 1 = black. Without this
      one layer of weights cannot cope with shapes moving around (it scores
      barely above guessing).
-  3. Encoding (rate coding): every pixel is an input neuron. At each of STEPS
-     time steps it fires a spike at random, more often the darker it is. Every
-     picture gets the same overall spike budget, so a thin outline and a big
-     filled shape send about the same number of spikes.
+  3. Encoding: every pixel is an input neuron, and the encoding decides when
+     it fires (all three are explained in spike_encodings.py):
+       rate     (default) fires at random each step, more often the darker it is
+       latency  fires once, earlier the darker it is
+       phase    fires in a repeating 8-step pattern that spells its darkness
+                in binary
+     Every picture gets the same total input, so a thin outline and a big
+     filled shape push the network equally hard.
   4. Neurons (leaky integrate-and-fire): every output neuron has a membrane
      potential v. Each step v leaks a little (v *= DECAY), then every input
-     spike adds that connection's weight. When v reaches THRESHOLD the neuron
-     fires a spike and v resets to 0. There is one output neuron per shape.
+     spike adds that connection's weight times the spike's size. When v
+     reaches THRESHOLD the neuron fires a spike and THRESHOLD is taken off v
+     (anything above the threshold is kept for later). There is one output
+     neuron per shape.
   5. Answer: the output neuron that fired the most spikes wins.
   6. Learning: after a batch of pictures the correct neuron should have fired
      at TARGET_RATE and the others not at all. Each weight changes by
@@ -44,14 +52,12 @@ except ImportError:
 
 from PIL import Image
 
+import spike_encodings
 import shape_seeds
-
-WEIGHTS_FILE = "snn_weights.npz"
 
 # network settings
 SIZE = 32            # pictures are shrunk to SIZE x SIZE input neurons
 STEPS = 50           # time steps each picture is shown for
-SPIKE_BUDGET = 60.0  # average number of input spikes per time step
 DECAY = 0.9          # membrane leak per step (closer to 1 = leaks slower)
 THRESHOLD = 1.0      # membrane potential that makes a neuron fire
 TARGET_RATE = 0.5    # how often the correct output neuron should fire
@@ -88,25 +94,19 @@ def make_dataset(master_seed, count, shapes, size=SIZE):
     return pictures, labels
 
 
-# ---------- encoding ----------
-def firing_rates(darkness):
-    """Chance per step that each input neuron fires (same total budget per picture)."""
-    darkness = np.atleast_2d(darkness)
-    total = darkness.sum(axis=1, keepdims=True)
-    return np.clip(darkness * SPIKE_BUDGET / np.maximum(total, 1e-9), 0.0, 1.0)
-
-
-def encode(darkness, steps, rng):
-    """Rate coding: returns spikes shaped (steps, pictures, inputs) of 0s and 1s."""
-    rates = firing_rates(darkness)
-    return (rng.random((steps,) + rates.shape) < rates).astype(np.float64)
+def output_names(encoding):
+    """Rate keeps the old file names; the other encodings get their own files."""
+    end = "" if encoding == "rate" else f"_{encoding}"
+    return {"weights": f"snn_weights{end}.npz", "weights_plot": f"snn_weights{end}.png",
+            "raster": f"snn_raster{end}.png", "predict": f"snn_predict{end}.png"}
 
 
 # ---------- the network ----------
 def run_network(weights, spikes, record=False):
     """Simulate leaky integrate-and-fire output neurons.
 
-    spikes: (steps, pictures, inputs). Returns spike counts (pictures, outputs),
+    spikes: (steps, pictures, inputs), 0 = no spike, otherwise the spike's size
+    (see spike_encodings.py). Returns spike counts (pictures, outputs),
     plus the output spikes and membrane potentials over time when record=True.
     """
     steps, batch, _ = spikes.shape
@@ -120,35 +120,38 @@ def run_network(weights, spikes, record=False):
         if record:
             potentials.append(v.copy())
             out_spikes.append(fired.copy())
-        v[fired] = 0.0                            # reset neurons that fired
+        # Reset by subtraction: take the threshold off and keep the rest. With
+        # latency coding most input arrives in one burst, and resetting to 0
+        # would throw almost all of it away after the first output spike.
+        v[fired] -= THRESHOLD
     if record:
         return counts, np.array(out_spikes), np.array(potentials)
     return counts
 
 
-def predict(weights, darkness, steps, rng):
-    counts = run_network(weights, encode(darkness, steps, rng))
+def predict(weights, darkness, steps, rng, encoding="rate"):
+    counts = run_network(weights, spike_encodings.encode(darkness, steps, rng, encoding))
     return counts.argmax(axis=1), counts
 
 
-def accuracy(weights, pictures, labels, steps, rng):
-    guesses, _ = predict(weights, pictures, steps, rng)
+def accuracy(weights, pictures, labels, steps, rng, encoding="rate"):
+    guesses, _ = predict(weights, pictures, steps, rng, encoding)
     return float((guesses == labels).mean())
 
 
-def train(pictures, labels, n_classes, epochs, lr, steps, rng, batch=32):
+def train(pictures, labels, n_classes, epochs, lr, steps, rng, encoding="rate", batch=32):
     weights = rng.normal(0.0, 0.01, (n_classes, pictures.shape[1]))
     for epoch in range(1, epochs + 1):
         order = rng.permutation(len(pictures))
         for start in range(0, len(order), batch):
             idx = order[start:start + batch]
-            spikes = encode(pictures[idx], steps, rng)
+            spikes = spike_encodings.encode(pictures[idx], steps, rng, encoding)
             out_rate = run_network(weights, spikes) / steps
-            in_rate = spikes.mean(axis=0)                     # (batch, inputs)
+            in_rate = spikes.mean(axis=0)     # (batch, inputs) average input per step
             wanted = np.zeros_like(out_rate)
             wanted[np.arange(len(idx)), labels[idx]] = TARGET_RATE
             weights += lr * (wanted - out_rate).T @ in_rate / len(idx)
-        acc = accuracy(weights, pictures, labels, steps, rng)
+        acc = accuracy(weights, pictures, labels, steps, rng, encoding)
         print(f"epoch {epoch:2d}/{epochs}  training accuracy {acc:6.1%}")
     return weights
 
@@ -172,9 +175,9 @@ def plot_weights(weights, shapes, path):
     plt.close(fig)
 
 
-def plot_raster(weights, darkness, label, shapes, steps, rng, path):
+def plot_raster(weights, darkness, label, shapes, steps, rng, path, encoding="rate"):
     import matplotlib.pyplot as plt
-    spikes = encode(darkness, steps, rng)
+    spikes = spike_encodings.encode(darkness, steps, rng, encoding)
     counts, out_spikes, potentials = run_network(weights, spikes, record=True)
     guess = int(counts[0].argmax())
     size = int(round(np.sqrt(darkness.size)))
@@ -188,7 +191,7 @@ def plot_raster(weights, darkness, label, shapes, steps, rng, path):
 
     t, neuron = np.nonzero(spikes[:, 0, :])
     axes[1].scatter(t, neuron, s=2, c="k")
-    axes[1].set(title="input spikes (one row per pixel)", xlabel="time step",
+    axes[1].set(title=f"{encoding} input spikes (one row per pixel)", xlabel="time step",
                 ylabel="input neuron", xlim=(-1, steps))
 
     t, neuron = np.nonzero(out_spikes[:, 0, :])
@@ -220,6 +223,8 @@ def main(argv=None):
     p.add_argument("--epochs", type=int, default=15, help="passes over the training set")
     p.add_argument("--lr", type=float, default=0.5, help="learning rate (default 0.5)")
     p.add_argument("--steps", type=int, default=STEPS, help="time steps per picture")
+    p.add_argument("--encoding", choices=spike_encodings.ENCODINGS, default="rate",
+                   help="how pictures become spikes: rate, latency or phase (default rate)")
     p.add_argument("--seed", default="snn", help="seed for pictures and spikes (default 'snn')")
     p.add_argument("--predict", metavar="IMAGE",
                    help="skip training: load saved weights and classify this picture")
@@ -229,31 +234,36 @@ def main(argv=None):
     master = shape_seeds.parse_seed(args.seed)
     rng = np.random.default_rng(master)
 
+    files = output_names(args.encoding)
+
     if args.predict:
-        if not os.path.exists(WEIGHTS_FILE):
-            sys.exit(f"No {WEIGHTS_FILE} yet. Train first:  python simple_snn.py")
-        saved = np.load(WEIGHTS_FILE)
+        if not os.path.exists(files["weights"]):
+            sys.exit(f"No {files['weights']} yet. Train first:  "
+                     f"python simple_snn.py --encoding {args.encoding}")
+        saved = np.load(files["weights"])
         weights, shapes = saved["weights"], [str(s) for s in saved["shapes"]]
         darkness = image_to_darkness(Image.open(args.predict).convert("RGBA"),
                                      int(round(np.sqrt(weights.shape[1]))))
-        guess, counts = predict(weights, darkness, args.steps, rng)
-        print(f"{args.predict}: looks like a {shapes[guess[0]]}")
+        guess, counts = predict(weights, darkness, args.steps, rng, args.encoding)
+        print(f"{args.predict}: looks like a {shapes[guess[0]]}  ({args.encoding} coding)")
         for name, c in sorted(zip(shapes, counts[0]), key=lambda x: -x[1]):
             print(f"  {name:10s} {int(c):3d} spikes")
         if not args.no_plots:
-            plot_raster(weights, darkness, None, shapes, args.steps, rng, "snn_predict.png")
-            print("spike plot saved to snn_predict.png")
+            plot_raster(weights, darkness, None, shapes, args.steps, rng, files["predict"],
+                        args.encoding)
+            print(f"spike plot saved to {files['predict']}")
         return 0
 
     print(f"making {args.train} training + {args.test} test pictures "
-          f"of {', '.join(args.shapes)} ...")
+          f"of {', '.join(args.shapes)}, {args.encoding} coding ...")
     # training and test pictures come from different master seeds, so they never overlap
     train_x, train_y = make_dataset(shape_seeds.child_seed(master, 0), args.train, args.shapes)
     test_x, test_y = make_dataset(shape_seeds.child_seed(master, 1), args.test, args.shapes)
 
-    weights = train(train_x, train_y, len(args.shapes), args.epochs, args.lr, args.steps, rng)
+    weights = train(train_x, train_y, len(args.shapes), args.epochs, args.lr, args.steps, rng,
+                    args.encoding)
 
-    guesses, _ = predict(weights, test_x, args.steps, rng)
+    guesses, _ = predict(weights, test_x, args.steps, rng, args.encoding)
     print(f"\ntest accuracy on {args.test} new pictures: {(guesses == test_y).mean():.1%}"
           f"  (guessing at random: {1 / len(args.shapes):.1%})")
     print("\nrows = real shape, columns = guess")
@@ -262,12 +272,14 @@ def main(argv=None):
         row = [(guesses[test_y == i] == j).sum() for j in range(len(args.shapes))]
         print(f"{name:>10s} " + "".join(f"{n:9d}" for n in row))
 
-    np.savez(WEIGHTS_FILE, weights=weights, shapes=np.array(args.shapes))
-    print(f"\nweights saved to {WEIGHTS_FILE}")
+    np.savez(files["weights"], weights=weights, shapes=np.array(args.shapes),
+             encoding=args.encoding)
+    print(f"\nweights saved to {files['weights']}")
     if not args.no_plots:
-        plot_weights(weights, args.shapes, "snn_weights.png")
-        plot_raster(weights, test_x[0], test_y[0], args.shapes, args.steps, rng, "snn_raster.png")
-        print("plots saved to snn_weights.png and snn_raster.png")
+        plot_weights(weights, args.shapes, files["weights_plot"])
+        plot_raster(weights, test_x[0], test_y[0], args.shapes, args.steps, rng, files["raster"],
+                    args.encoding)
+        print(f"plots saved to {files['weights_plot']} and {files['raster']}")
     return 0
 
 
